@@ -1,29 +1,215 @@
-import { PGlite } from '@electric-sql/pglite';
 import path from 'path';
 import fs from 'fs';
+import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
+import pgPkg from 'pg';
 
-// Ensure data directory exists for PostgreSQL persistence
-const dataDir = path.join(process.cwd(), '.pglite_data');
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
+const { Pool } = pgPkg;
+
+interface QueryResult<T = any> {
+  rows: T[];
+  rowCount?: number;
 }
 
-const rawPg = new PGlite(dataDir);
-export const pg = {
-  exec: (sql: string) => rawPg.exec(sql),
-  query: async <T = any>(sql: string, params?: any[]): Promise<{ rows: T[] }> => {
-    const res = await rawPg.query<T>(sql, params);
-    return res as unknown as { rows: T[] };
+interface DatabaseAdapter {
+  exec: (sql: string) => Promise<void>;
+  query: <T = any>(sql: string, params?: any[]) => Promise<QueryResult<T>>;
+  transaction: <T = any>(callback: (tx: DatabaseAdapter) => Promise<T>) => Promise<T>;
+}
+
+// ---------------------------------------------------------------------------
+// 1. PostgreSQL Adapter (Used when DATABASE_URL is set, e.g. Render/Cloud SQL)
+// ---------------------------------------------------------------------------
+let pool: pgPkg.Pool | null = null;
+if (process.env.DATABASE_URL) {
+  console.log('[Database] Connecting to PostgreSQL via DATABASE_URL...');
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL.includes('localhost')
+      ? false
+      : { rejectUnauthorized: false },
+    max: 5,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 2. Embedded SQLite (sql.js) Adapter (Zero-config, ~60MB RAM fallback)
+// ---------------------------------------------------------------------------
+let sqliteDb: SqlJsDatabase | null = null;
+const dbFilePath = path.join(process.cwd(), '.fareflow.sqlite');
+
+function saveSqliteToFile() {
+  if (!sqliteDb) return;
+  try {
+    const data = sqliteDb.export();
+    fs.writeFileSync(dbFilePath, Buffer.from(data));
+  } catch (err) {
+    console.error('[Database] Error saving SQLite database to disk:', err);
+  }
+}
+
+async function getSqliteDb(): Promise<SqlJsDatabase> {
+  if (sqliteDb) return sqliteDb;
+
+  const SQL = await initSqlJs();
+  if (fs.existsSync(dbFilePath)) {
+    try {
+      const fileBuffer = fs.readFileSync(dbFilePath);
+      sqliteDb = new SQL.Database(fileBuffer);
+      console.log('[Database] Loaded existing database from disk:', dbFilePath);
+      return sqliteDb;
+    } catch (err) {
+      console.warn('[Database] Could not read existing sqlite file, creating fresh database:', err);
+    }
+  }
+
+  sqliteDb = new SQL.Database();
+  console.log('[Database] Initialized fresh SQLite database instance.');
+  return sqliteDb;
+}
+
+// Helper: Translate PostgreSQL DDL & dialect queries into SQLite compatible syntax
+function sanitizeSqlForSqlite(sql: string): string {
+  return sql
+    .replace(/\bSERIAL\s+PRIMARY\s+KEY\b/gi, 'INTEGER PRIMARY KEY AUTOINCREMENT')
+    .replace(/\bTIMESTAMP\s+WITH\s+TIME\s+ZONE\b/gi, 'DATETIME')
+    .replace(/\bTIMESTAMP\s+WITHOUT\s+TIME\s+ZONE\b/gi, 'DATETIME')
+    .replace(/\bJSONB\b/gi, 'TEXT')
+    .replace(/\bILIKE\b/gi, 'LIKE')
+    .replace(/CURRENT_TIMESTAMP\s*-\s*INTERVAL\s*'(\d+)\s*hours?'/gi, "datetime('now', '-$1 hours')")
+    .replace(/CURRENT_TIMESTAMP\s*-\s*INTERVAL\s*'(\d+)\s*minutes?'/gi, "datetime('now', '-$1 minutes')")
+    .replace(/CURRENT_TIMESTAMP\s*-\s*INTERVAL\s*'4\s*hours\s*40\s*minutes?'/gi, "datetime('now', '-4 hours')");
+}
+
+function sanitizeParamsForSqlite(params?: any[]): any[] {
+  if (!params || !Array.isArray(params)) return [];
+  return params.map(val => {
+    if (typeof val === 'boolean') return val ? 1 : 0;
+    if (val !== null && typeof val === 'object') {
+      try {
+        return JSON.stringify(val);
+      } catch {
+        return String(val);
+      }
+    }
+    return val;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Unified Exported Database Interface (pg)
+// ---------------------------------------------------------------------------
+export const pg: DatabaseAdapter = {
+  exec: async (sql: string): Promise<void> => {
+    if (pool) {
+      await pool.query(sql);
+      return;
+    }
+
+    const db = await getSqliteDb();
+    const sanitized = sanitizeSqlForSqlite(sql);
+    db.run(sanitized);
+    saveSqliteToFile();
   },
-  transaction: <T = any>(callback: (tx: any) => Promise<T>): Promise<T> => {
-    return rawPg.transaction(callback as any) as Promise<T>;
+
+  query: async <T = any>(sql: string, params?: any[]): Promise<QueryResult<T>> => {
+    if (pool) {
+      const res = await pool.query(sql, params);
+      return { rows: res.rows as T[], rowCount: res.rowCount ?? res.rows.length };
+    }
+
+    const db = await getSqliteDb();
+    const sanitizedSql = sanitizeSqlForSqlite(sql);
+    const sanitizedParams = sanitizeParamsForSqlite(params);
+
+    try {
+      if (!sanitizedParams || sanitizedParams.length === 0) {
+        // Query without parameters
+        const isSelectOrReturning = /^\s*(SELECT|INSERT.*RETURNING|UPDATE.*RETURNING|DELETE.*RETURNING)/i.test(sanitizedSql);
+        
+        if (isSelectOrReturning) {
+          const stmt = db.prepare(sanitizedSql);
+          const rows: T[] = [];
+          while (stmt.step()) {
+            rows.push(stmt.getAsObject() as unknown as T);
+          }
+          stmt.free();
+          return { rows, rowCount: rows.length };
+        } else {
+          db.run(sanitizedSql);
+          saveSqliteToFile();
+          return { rows: [], rowCount: 1 };
+        }
+      } else {
+        // Parameterized query ($1, $2, ...)
+        const stmt = db.prepare(sanitizedSql);
+        stmt.bind(sanitizedParams);
+        const rows: T[] = [];
+        while (stmt.step()) {
+          rows.push(stmt.getAsObject() as unknown as T);
+        }
+        stmt.free();
+
+        // If it was a mutation, persist to disk
+        if (!/^\s*SELECT/i.test(sanitizedSql)) {
+          saveSqliteToFile();
+        }
+
+        return { rows, rowCount: rows.length };
+      }
+    } catch (err: any) {
+      console.error('[Database Error] SQL failed:', sanitizedSql, 'Params:', sanitizedParams, 'Error:', err);
+      throw err;
+    }
+  },
+
+  transaction: async <T = any>(callback: (tx: DatabaseAdapter) => Promise<T>): Promise<T> => {
+    if (pool) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const txAdapter: DatabaseAdapter = {
+          exec: async (s: string) => { await client.query(s); },
+          query: async <R = any>(s: string, p?: any[]) => {
+            const res = await client.query(s, p);
+            return { rows: res.rows as R[], rowCount: res.rowCount ?? res.rows.length };
+          },
+          transaction: async <R = any>(cb: any) => cb(txAdapter),
+        };
+        const result = await callback(txAdapter);
+        await client.query('COMMIT');
+        return result;
+      } catch (err) {
+        await client.query('ROLLBACK');
+        throw err;
+      } finally {
+        client.release();
+      }
+    }
+
+    // For SQLite, wrap in BEGIN / COMMIT
+    const db = await getSqliteDb();
+    db.run('BEGIN TRANSACTION;');
+    try {
+      const result = await callback(pg);
+      db.run('COMMIT;');
+      saveSqliteToFile();
+      return result;
+    } catch (err) {
+      try {
+        db.run('ROLLBACK;');
+      } catch {}
+      throw err;
+    }
   }
 };
 
+// ---------------------------------------------------------------------------
+// Database Initialization & Seed Data (047 Nganya SACCO)
+// ---------------------------------------------------------------------------
 export async function initDatabase() {
-  console.log('[Database] Initializing PostgreSQL database with FareFlow schema...');
+  console.log('[Database] Initializing schema and seed records...');
 
-  // Create tables with relational constraints, foreign keys, and indexes
+  // Create tables
   await pg.exec(`
     -- 1. Vehicles Table
     CREATE TABLE IF NOT EXISTS vehicles (
@@ -63,12 +249,12 @@ export async function initDatabase() {
     -- 4. Shifts Table
     CREATE TABLE IF NOT EXISTS shifts (
       id SERIAL PRIMARY KEY,
-      conductor_id INTEGER NOT NULL REFERENCES conductors(id) ON DELETE RESTRICT,
-      vehicle_id INTEGER NOT NULL REFERENCES vehicles(id) ON DELETE RESTRICT,
-      route_id INTEGER NOT NULL REFERENCES routes(id) ON DELETE RESTRICT,
-      fare_mode VARCHAR(20) NOT NULL DEFAULT 'STANDARD', -- 'STANDARD', 'PEAK', 'OFF_PEAK'
+      conductor_id INTEGER NOT NULL REFERENCES conductors(id),
+      vehicle_id INTEGER NOT NULL REFERENCES vehicles(id),
+      route_id INTEGER NOT NULL REFERENCES routes(id),
+      fare_mode VARCHAR(20) NOT NULL DEFAULT 'STANDARD',
       current_fare_amount INTEGER NOT NULL DEFAULT 100,
-      status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE', -- 'ACTIVE', 'COMPLETED'
+      status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
       start_time TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
       end_time TIMESTAMP WITH TIME ZONE,
       opening_cash INTEGER NOT NULL DEFAULT 0,
@@ -84,15 +270,15 @@ export async function initDatabase() {
     -- 5. Fares Table
     CREATE TABLE IF NOT EXISTS fares (
       id SERIAL PRIMARY KEY,
-      shift_id INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
-      conductor_id INTEGER NOT NULL REFERENCES conductors(id) ON DELETE RESTRICT,
-      vehicle_id INTEGER NOT NULL REFERENCES vehicles(id) ON DELETE RESTRICT,
-      route_id INTEGER NOT NULL REFERENCES routes(id) ON DELETE RESTRICT,
+      shift_id INTEGER NOT NULL REFERENCES shifts(id),
+      conductor_id INTEGER NOT NULL REFERENCES conductors(id),
+      vehicle_id INTEGER NOT NULL REFERENCES vehicles(id),
+      route_id INTEGER NOT NULL REFERENCES routes(id),
       amount INTEGER NOT NULL,
-      fare_type VARCHAR(30) NOT NULL DEFAULT 'STANDARD', -- 'STANDARD', 'STUDENT', 'SHORT_STAGE', 'CUSTOM'
+      fare_type VARCHAR(30) NOT NULL DEFAULT 'STANDARD',
       stage_name VARCHAR(100) DEFAULT 'Stage Stop',
-      payment_method VARCHAR(30) NOT NULL, -- 'MPESA_STK', 'CASH', 'DYNAMIC_QR'
-      status VARCHAR(30) NOT NULL DEFAULT 'PENDING', -- 'PENDING', 'CONFIRMED', 'FAILED', 'DISPUTED'
+      payment_method VARCHAR(30) NOT NULL,
+      status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
       idempotency_key VARCHAR(100) UNIQUE NOT NULL,
       passenger_phone VARCHAR(20),
       mpesa_receipt_number VARCHAR(50),
@@ -102,14 +288,14 @@ export async function initDatabase() {
       updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
 
-    -- 6. Payments Table (Granular transaction ledger)
+    -- 6. Payments Table
     CREATE TABLE IF NOT EXISTS payments (
       id SERIAL PRIMARY KEY,
-      fare_id INTEGER REFERENCES fares(id) ON DELETE SET NULL,
-      shift_id INTEGER NOT NULL REFERENCES shifts(id) ON DELETE CASCADE,
+      fare_id INTEGER REFERENCES fares(id),
+      shift_id INTEGER NOT NULL REFERENCES shifts(id),
       amount INTEGER NOT NULL,
-      method VARCHAR(30) NOT NULL, -- 'MPESA_STK', 'CASH', 'DYNAMIC_QR'
-      status VARCHAR(30) NOT NULL DEFAULT 'INITIATED', -- 'INITIATED', 'SUCCESS', 'FAILED', 'CANCELLED'
+      method VARCHAR(30) NOT NULL,
+      status VARCHAR(30) NOT NULL DEFAULT 'INITIATED',
       provider VARCHAR(50) NOT NULL DEFAULT 'DARAJA_MPESA',
       checkout_request_id VARCHAR(100) UNIQUE,
       merchant_request_id VARCHAR(100),
@@ -121,20 +307,19 @@ export async function initDatabase() {
       updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
 
-    -- 7. Sync Queue Table (Client offline batch reconciliation & deduplication)
+    -- 7. Sync Queue Table
     CREATE TABLE IF NOT EXISTS sync_queue (
       id SERIAL PRIMARY KEY,
       client_tx_id VARCHAR(100) UNIQUE NOT NULL,
-      shift_id INTEGER REFERENCES shifts(id) ON DELETE CASCADE,
-      conductor_id INTEGER REFERENCES conductors(id) ON DELETE SET NULL,
+      shift_id INTEGER REFERENCES shifts(id),
+      conductor_id INTEGER REFERENCES conductors(id),
       payload JSONB NOT NULL,
-      sync_status VARCHAR(30) NOT NULL DEFAULT 'QUEUED', -- 'QUEUED', 'PROCESSED', 'CONFLICT', 'ERROR'
+      sync_status VARCHAR(30) NOT NULL DEFAULT 'QUEUED',
       error_message TEXT,
       processed_at TIMESTAMP WITH TIME ZONE,
       created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
 
-    -- Create helpful indexes
     CREATE INDEX IF NOT EXISTS idx_fares_shift ON fares(shift_id);
     CREATE INDEX IF NOT EXISTS idx_fares_status ON fares(status);
     CREATE INDEX IF NOT EXISTS idx_fares_receipt ON fares(mpesa_receipt_number);
@@ -146,7 +331,7 @@ export async function initDatabase() {
   // Seed default vehicles if empty
   const vehicleCount = await pg.query(`SELECT COUNT(*) as count FROM vehicles;`);
   if (Number((vehicleCount.rows[0] as any).count) === 0) {
-    console.log('[Database] Seeding demo vehicles...');
+    console.log('[Database] Seeding 047 Nganya SACCO vehicles...');
     await pg.exec(`
       INSERT INTO vehicles (reg_number, fleet_name, sacco_name, capacity) VALUES
       ('KDA 482G', 'G-Force Express', '047 Nganya SACCO', 33),
@@ -156,7 +341,7 @@ export async function initDatabase() {
     `);
   }
 
-  // Ensure any existing records reflect 047 Nganya SACCO
+  // Ensure all existing vehicles reflect 047 Nganya SACCO
   await pg.exec(`
     UPDATE vehicles SET sacco_name = '047 Nganya SACCO' WHERE sacco_name ILIKE '%super metro%';
     UPDATE conductors SET sacco = '047 Nganya SACCO' WHERE sacco ILIKE '%super metro%';
@@ -165,7 +350,7 @@ export async function initDatabase() {
   // Seed default routes if empty
   const routeCount = await pg.query(`SELECT COUNT(*) as count FROM routes;`);
   if (Number((routeCount.rows[0] as any).count) === 0) {
-    console.log('[Database] Seeding demo routes...');
+    console.log('[Database] Seeding Nairobi routes...');
     await pg.exec(`
       INSERT INTO routes (code, name, base_fare, peak_fare, off_peak_fare) VALUES
       ('105', 'CBD - Rongai (via Langata Rd)', 100, 120, 80),
@@ -178,8 +363,7 @@ export async function initDatabase() {
   // Seed default conductors if empty
   const conductorCount = await pg.query(`SELECT COUNT(*) as count FROM conductors;`);
   if (Number((conductorCount.rows[0] as any).count) === 0) {
-    console.log('[Database] Seeding demo conductors...');
-    // Simple PIN storage (in production hashed with bcrypt; for easy demo PINs 1234, 2540, 0000)
+    console.log('[Database] Seeding conductors...');
     await pg.exec(`
       INSERT INTO conductors (name, phone_number, pin_hash, sacco, national_id) VALUES
       ('Kiprono "Kevo" Langat', '0712345678', '1234', '047 Nganya SACCO', '32456789'),
@@ -188,12 +372,11 @@ export async function initDatabase() {
     `);
   }
 
-  // Seed some historic shifts and fares so SACCO / Owner Dashboard has rich analytics immediately
+  // Seed initial shift and historical fares for immediate analytics
   const shiftCount = await pg.query(`SELECT COUNT(*) as count FROM shifts;`);
   if (Number((shiftCount.rows[0] as any).count) === 0) {
-    console.log('[Database] Seeding initial shift and reconciled transaction history...');
+    console.log('[Database] Seeding demo shifts and audited transactions...');
     await pg.exec(`
-      -- Insert a completed shift from earlier today
       INSERT INTO shifts (
         conductor_id, vehicle_id, route_id, fare_mode, current_fare_amount,
         status, start_time, end_time, opening_cash, closing_cash,
@@ -204,7 +387,6 @@ export async function initDatabase() {
         500, 4200, 12840, 3700, 9140, 107, 'Morning peak run. Heavy traffic at Galleria. Reconciled clean.'
       );
 
-      -- Insert some historical completed fares for audit
       INSERT INTO fares (
         shift_id, conductor_id, vehicle_id, route_id, amount,
         fare_type, stage_name, payment_method, status,
@@ -218,5 +400,5 @@ export async function initDatabase() {
     `);
   }
 
-  console.log('[Database] Schema and seed data successfully initialized.');
+  console.log('[Database] Schema and initial seed data ready.');
 }
