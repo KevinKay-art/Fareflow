@@ -1,0 +1,6 @@
+{
+  "name": "FareFlow",
+  "description": "Digital fare collection system for matatu conductors featuring 3-tap charging, M-Pesa STK push, offline resilience with IndexedDB, and shift reconciliation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
